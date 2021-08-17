@@ -21,6 +21,7 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/typeurl"
 	"github.com/google/cadvisor/container"
+	criapi "github.com/google/cadvisor/container/cri-api/pkg/apis/runtime/v1"
 	containerlibcontainer "github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
@@ -45,7 +46,7 @@ func (m *mockedMachineInfo) GetVersionInfo() (*info.VersionInfo, error) {
 func TestHandler(t *testing.T) {
 	as := assert.New(t)
 	type testCase struct {
-		client             ContainerdClient
+		client             criapi.RuntimeServiceClient
 		name               string
 		machineInfoFactory info.MachineInfoFactory
 		fsInfo             fs.FsInfo
@@ -69,7 +70,8 @@ func TestHandler(t *testing.T) {
 	testContainers["40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9"] = testContainer
 	for _, ts := range []testCase{
 		{
-			mockcontainerdClient(nil, nil),
+			//mockcontainerdClient(nil, nil),
+			mockCriClient(),
 			"/kubepods/pod068e8fa0-9213-11e7-a01f-507b9d4141fa/40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9",
 			nil,
 			nil,
@@ -83,7 +85,8 @@ func TestHandler(t *testing.T) {
 			nil,
 		},
 		{
-			mockcontainerdClient(testContainers, nil),
+			//mockcontainerdClient(testContainers, nil),
+			mockCriClient(),
 			"/kubepods/pod068e8fa0-9213-11e7-a01f-507b9d4141fa/40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9",
 			&mockedMachineInfo{},
 			nil,
@@ -102,7 +105,8 @@ func TestHandler(t *testing.T) {
 			map[string]string{},
 		},
 		{
-			mockcontainerdClient(testContainers, nil),
+			//mockcontainerdClient(testContainers, nil),
+			mockCriClient(),
 			"/kubepods/pod068e8fa0-9213-11e7-a01f-507b9d4141fa/40af7cdcbe507acad47a5a62025743ad3ddc6ab93b77b21363aa1c1d641047c9",
 			&mockedMachineInfo{},
 			nil,

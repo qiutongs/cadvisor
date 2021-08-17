@@ -19,9 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
 
-	"github.com/containerd/containerd/errdefs"
 	"golang.org/x/net/context"
 
 	"github.com/google/cadvisor/container"
@@ -29,7 +27,9 @@ import (
 	containerlibcontainer "github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
+
+	criapi "github.com/google/cadvisor/container/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 type containerdContainerHandler struct {
@@ -54,7 +54,7 @@ var _ container.ContainerHandler = &containerdContainerHandler{}
 
 // newContainerdContainerHandler returns a new container.ContainerHandler
 func newContainerdContainerHandler(
-	client ContainerdClient,
+	client criapi.RuntimeServiceClient,
 	name string,
 	machineInfoFactory info.MachineInfoFactory,
 	fsInfo fs.FsInfo,
@@ -73,38 +73,26 @@ func newContainerdContainerHandler(
 	}
 
 	id := ContainerNameToContainerdID(name)
-	// We assume that if load fails then the container is not known to containerd.
 	ctx := context.Background()
-	cntr, err := client.LoadContainer(ctx, id)
+	statusRes, err := client.ContainerStatus(ctx, &criapi.ContainerStatusRequest{
+		ContainerId: id,
+		Verbose:     true, // This makes containerd returns extra information in statusRes.Info
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	var spec specs.Spec
-	if err := json.Unmarshal(cntr.Spec.Value, &spec); err != nil {
-		return nil, err
+	if statusRes.Info == nil || statusRes.Info["info"] == "" {
+		return nil, fmt.Errorf("could not get info of ContainerStatusResponse: %v", statusRes.Info)
 	}
 
-	// Cgroup is created during task creation. When cadvisor sees the cgroup,
-	// task may not be fully created yet. Use a retry+backoff to tolerant the
-	// race condition.
-	// TODO(random-liu): Use cri-containerd client to talk with cri-containerd
-	// instead. cri-containerd has some internal synchronization to make sure
-	// `ContainerStatus` only returns result after `StartContainer` finishes.
-	var taskPid uint32
-	backoff := 100 * time.Millisecond
-	retry := 5
-	for {
-		taskPid, err = client.TaskPid(ctx, id)
-		if err == nil {
-			break
-		}
-		retry--
-		if !errdefs.IsNotFound(err) || retry == 0 {
-			return nil, err
-		}
-		time.Sleep(backoff)
-		backoff *= 2
+	containerInfo := struct {
+		Pid         uint32      `json:"pid"`
+		RuntimeSpec *specs.Spec `json:"runtimeSpec"`
+	}{}
+
+	if err := json.Unmarshal([]byte(statusRes.Info["info"]), &containerInfo); err != nil {
+		return nil, err
 	}
 
 	rootfs := "/"
@@ -119,20 +107,20 @@ func newContainerdContainerHandler(
 		Aliases:   []string{id, name},
 	}
 
-	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootfs, int(taskPid), includedMetrics)
+	libcontainerHandler := containerlibcontainer.NewHandler(cgroupManager, rootfs, int(containerInfo.Pid), includedMetrics)
 
 	handler := &containerdContainerHandler{
 		machineInfoFactory:  machineInfoFactory,
 		cgroupPaths:         cgroupPaths,
 		fsInfo:              fsInfo,
 		envs:                make(map[string]string),
-		labels:              cntr.Labels,
+		labels:              statusRes.Status.Labels,
 		includedMetrics:     includedMetrics,
 		reference:           containerReference,
 		libcontainerHandler: libcontainerHandler,
 	}
 	// Add the name and bare ID as aliases of the container.
-	handler.image = cntr.Image
+	handler.image = statusRes.Status.Image.Image
 
 	for _, exposedEnv := range metadataEnvs {
 		if exposedEnv == "" {
@@ -140,7 +128,7 @@ func newContainerdContainerHandler(
 			continue
 		}
 
-		for _, envVar := range spec.Process.Env {
+		for _, envVar := range containerInfo.RuntimeSpec.Process.Env {
 			if envVar != "" {
 				splits := strings.SplitN(envVar, "=", 2)
 				if len(splits) == 2 && strings.HasPrefix(splits[0], exposedEnv) {

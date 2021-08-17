@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/containerd/containerd/containers"
+	criapi "github.com/google/cadvisor/container/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 type containerdClientMock struct {
@@ -50,4 +51,8 @@ func mockcontainerdClient(cntrs map[string]*containers.Container, returnErr erro
 		cntrs:     cntrs,
 		returnErr: returnErr,
 	}
+}
+
+func mockCriClient() criapi.RuntimeServiceClient {
+	return nil
 }

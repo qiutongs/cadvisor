@@ -17,14 +17,20 @@ package containerd
 import (
 	"flag"
 	"fmt"
+	"net"
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"k8s.io/klog/v2"
 
+	"github.com/containerd/containerd/pkg/dialer"
 	"github.com/google/cadvisor/container"
+	criapi "github.com/google/cadvisor/container/cri-api/pkg/apis/runtime/v1alpha2" // TODO: update to v1
 	"github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
 	info "github.com/google/cadvisor/info/v1"
@@ -43,9 +49,12 @@ var containerdCgroupRegexp = regexp.MustCompile(`([a-z0-9]{64})`)
 
 var containerdEnvWhitelist = flag.String("containerd_env_metadata_whitelist", "", "a comma-separated list of environment variable keys matched with specified prefix that needs to be collected for containerd containers")
 
+var criClient criapi.RuntimeServiceClient = nil
+var onceCriClient sync.Once
+
 type containerdFactory struct {
 	machineInfoFactory info.MachineInfoFactory
-	client             ContainerdClient
+	client             criapi.RuntimeServiceClient
 	version            string
 	// Information about the mounted cgroup subsystems.
 	cgroupSubsystems libcontainer.CgroupSubsystems
@@ -59,7 +68,7 @@ func (f *containerdFactory) String() string {
 }
 
 func (f *containerdFactory) NewContainerHandler(name string, inHostNamespace bool) (handler container.ContainerHandler, err error) {
-	client, err := Client(*ArgContainerdEndpoint, *ArgContainerdNamespace)
+	err = NewCriClient()
 	if err != nil {
 		return
 	}
@@ -67,7 +76,7 @@ func (f *containerdFactory) NewContainerHandler(name string, inHostNamespace boo
 	metadataEnvs := strings.Split(*containerdEnvWhitelist, ",")
 
 	return newContainerdContainerHandler(
-		client,
+		criClient,
 		name,
 		f.machineInfoFactory,
 		f.fsInfo,
@@ -108,7 +117,9 @@ func (f *containerdFactory) CanHandleAndAccept(name string) (bool, bool, error) 
 	// If container and task lookup in containerd fails then we assume
 	// that the container state is not known to containerd
 	ctx := context.Background()
-	_, err := f.client.LoadContainer(ctx, id)
+	_, err := f.client.ContainerStatus(ctx, &criapi.ContainerStatusRequest{
+		ContainerId: id,
+	})
 	if err != nil {
 		return false, false, fmt.Errorf("failed to load container: %v", err)
 	}
@@ -122,12 +133,12 @@ func (f *containerdFactory) DebugInfo() map[string][]string {
 
 // Register root container before running this function!
 func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics container.MetricSet) error {
-	client, err := Client(*ArgContainerdEndpoint, *ArgContainerdNamespace)
+	err := NewCriClient()
 	if err != nil {
 		return fmt.Errorf("unable to create containerd client: %v", err)
 	}
 
-	containerdVersion, err := client.Version(context.Background())
+	versionRes, err := criClient.Version(context.Background(), &criapi.VersionRequest{})
 	if err != nil {
 		return fmt.Errorf("failed to fetch containerd client version: %v", err)
 	}
@@ -140,13 +151,52 @@ func Register(factory info.MachineInfoFactory, fsInfo fs.FsInfo, includedMetrics
 	klog.V(1).Infof("Registering containerd factory")
 	f := &containerdFactory{
 		cgroupSubsystems:   cgroupSubsystems,
-		client:             client,
+		client:             criClient,
 		fsInfo:             fsInfo,
 		machineInfoFactory: factory,
-		version:            containerdVersion,
+		version:            versionRes.RuntimeVersion,
 		includedMetrics:    includedMetrics,
 	}
 
 	container.RegisterContainerHandlerFactory(f, []watcher.ContainerWatchSource{watcher.Raw})
 	return nil
+}
+
+func NewCriClient() error {
+	var retErr error
+	onceCriClient.Do(func() {
+		tryConn, err := net.DialTimeout("unix", *ArgContainerdEndpoint, connectionTimeout)
+		if err != nil {
+			retErr = fmt.Errorf("containerd: cannot unix dial containerd cri service: %v", err)
+			return
+		}
+		tryConn.Close()
+
+		connParams := grpc.ConnectParams{
+			Backoff: backoff.DefaultConfig,
+		}
+		connParams.Backoff.BaseDelay = baseBackoffDelay
+		connParams.Backoff.MaxDelay = maxBackoffDelay
+		gopts := []grpc.DialOption{
+			grpc.WithInsecure(),
+			grpc.WithContextDialer(dialer.ContextDialer),
+			grpc.WithBlock(),
+			grpc.WithConnectParams(connParams),
+		}
+		unary, stream := newNSInterceptors(*ArgContainerdNamespace)
+		gopts = append(gopts,
+			grpc.WithUnaryInterceptor(unary),
+			grpc.WithStreamInterceptor(stream),
+		)
+
+		ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+		defer cancel()
+		conn, err := grpc.DialContext(ctx, dialer.DialAddress(*ArgContainerdEndpoint), gopts...)
+		if err != nil {
+			retErr = err
+			return
+		}
+		criClient = criapi.NewRuntimeServiceClient(conn)
+	})
+	return retErr
 }
